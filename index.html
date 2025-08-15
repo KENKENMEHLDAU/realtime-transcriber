@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>リアルタイム字幕（英語→日本語）— ブラウザ完結</title>
+<style>
+  :root{--bg:#0b1220;--panel:#0f172a;--text:#e5e7eb;--muted:#9fb3c8;--border:#243041;--accent:#22c55e;--danger:#ef4444}
+  *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#0b1220,#0f172a);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:16px 12px;text-align:center} h1{margin:0;font-size:clamp(18px,3vw,24px)}
+  .app{max-width:1100px;margin:0 auto;padding:0 12px 22px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .card{background:rgba(17,24,39,.7);border:1px solid var(--border);border-radius:12px;padding:12px}
+  select,button{padding:9px 12px;border-radius:10px;border:1px solid var(--border);background:#0d1424;color:#fff}
+  button.primary{background:var(--accent);border-color:transparent;color:#06250f;font-weight:700}
+  button.danger{background:var(--danger);border-color:transparent}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .pane{background:#0b1220;border:1px solid var(--border);border-radius:12px;min-height:320px;padding:10px;overflow:auto;line-height:1.6}
+  .pane h3{margin:6px 0 8px 0;font-size:14px;color:#b7c6dc}
+  .line{margin:2px 0}
+  .ts{color:#8ea6c8;font-family:ui-monospace,Consolas,Menlo,monospace;margin-right:6px}
+  .status{font-size:12px;color:#9fb3c8}
+  progress{width:100%}
+  .mono{font-family:ui-monospace,Consolas,Menlo,monospace}
+  .warn{background:#3b2f00;border:1px solid #7c5c00;color:#ffe08a;padding:8px;border-radius:8px;margin-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>リアルタイム録音 → 文字起こし（左：英語 / 右：日本語訳）</h1>
+  <div id="secureHint" class="status"></div>
+</header>
+
+<div class="app">
+  <div class="card">
+    <div class="row">
+      <label>ASRモデル
+        <select id="asrModel">
+          <option value="Xenova/whisper-tiny.en" selected>whisper-tiny.en（最速）</option>
+          <option value="Xenova/whisper-base.en">whisper-base.en</option>
+          <option value="Xenova/whisper-small.en">whisper-small.en（精度↑）</option>
+        </select>
+      </label>
+      <label>バッファ長
+        <select id="bufSec">
+          <option value="2.0">2.0s（最速）</option>
+          <option value="2.5" selected>2.5s（安定）</option>
+          <option value="3.0">3.0s（安定↑）</option>
+        </select>
+      </label>
+      <label>オーバーラップ
+        <select id="overlapSec">
+          <option value="0.3">0.3s</option>
+          <option value="0.5" selected>0.5s</option>
+          <option value="0.8">0.8s</option>
+          <option value="0">なし（最速）</option>
+        </select>
+      </label>
+      <label>VAD（無音スキップ）
+        <select id="vad">
+          <option value="normal" selected>Normal</option>
+          <option value="strong">Strong（速い）</option>
+          <option value="off">Off（遅い）</option>
+        </select>
+      </label>
+      <button id="startBtn" class="primary">🎙️ 開始</button>
+      <button id="stopBtn" class="danger" disabled>⏹ 停止</button>
+      <span id="stat" class="status">準備OK：開始を押してください</span>
+    </div>
+    <div class="warn" id="insecureWarn" style="display:none">
+      このページは <b>file:///</b> で開かれている可能性があります。ブラウザは <b>file</b> 直開きではマイク許可ポップアップを出しません。<br>
+      <b>http://localhost</b> か <b>https://</b> で開くか、Electronアプリ内でご利用ください。
+    </div>
+    <div style="margin-top:8px">
+      <progress id="prog" max="100" value="0"></progress>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:12px">
+    <div class="card"><div class="pane" id="paneEn" aria-live="polite"><h3>English (ASR)</h3></div></div>
+    <div class="card"><div class="pane" id="paneJa" aria-live="polite"><h3>日本語訳 (EN→JA)</h3></div></div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <div class="status mono" id="log"></div>
+  </div>
+</div>
+
+<script>
+/* ===== ヘルパ ===== */
+const logEl=document.getElementById('log'), stat=document.getElementById('stat'), prog=document.getElementById('prog');
+const paneEn=document.getElementById('paneEn'), paneJa=document.getElementById('paneJa');
+const asrModelSel=document.getElementById('asrModel'), bufSel=document.getElementById('bufSec'), ovSel=document.getElementById('overlapSec'), vadSel=document.getElementById('vad');
+const startBtn=document.getElementById('startBtn'), stopBtn=document.getElementById('stopBtn');
+const log=(m)=>{logEl.textContent+=(logEl.textContent?'\n':'')+m;logEl.scrollTop=logEl.scrollHeight;};
+const tfmt=(s)=>{const mm=String(Math.floor(s/60)).padStart(2,'0'); const ss=String(Math.floor(s%60)).padStart(2,'0'); return mm+':'+ss;};
+window.onerror=(msg,src,line,col,err)=>{log('[window.onerror] '+msg+' @'+(src||'')+':'+(line||'')+':'+(col||'')); if(err?.stack) log(err.stack);};
+window.addEventListener('unhandledrejection',e=>log('[unhandledrejection] '+(e.reason&&(e.reason.stack||e.reason))));
+
+/* ===== 安全なコンテキスト警告 ===== */
+const isElectron = !!(navigator.userAgent && navigator.userAgent.toLowerCase().includes('electron'));
+const isSecure = location.protocol==='https:' || location.hostname==='localhost' || location.hostname==='127.0.0.1' || isElectron;
+document.getElementById('secureHint').textContent = isElectron ? 'Electron環境で実行中' : (isSecure ? '安全なコンテキストで実行中' : '注意：安全なコンテキストではありません');
+document.getElementById('insecureWarn').style.display = isSecure ? 'none' : 'block';
+
+/* ===== Transformers ロード（IIFE→ESM） ===== */
+async function ensureTransformers(){
+  if(window.transformers?.pipeline) return 'already';
+  const IIFE=['./transformers.min.js','https://cdn.jsdelivr.net/npm/@xenova/transformers@2/dist/transformers.min.js','https://unpkg.com/@xenova/transformers@2.14.0/dist/transformers.min.js'];
+  const loadIIFE=url=>new Promise((res,rej)=>{const s=document.createElement('script');s.src=url;s.defer=true;s.crossOrigin='anonymous';s.onload=()=>res(url);s.onerror=()=>rej(new Error('IIFE failed: '+url));document.head.appendChild(s);});
+  for(const u of IIFE){try{log('transformers(IIFE)試行: '+u);await loadIIFE(u);if(window.transformers?.pipeline){log('IIFE成功: '+u);return u;}log('IIFE後もpipelineなし: '+u);}catch(e){log(e.message);}}
+  const ESM=['https://unpkg.com/@xenova/transformers@2?module','https://esm.sh/@xenova/transformers@2?bundle'];
+  for(const u of ESM){try{log('transformers(ESM)試行: '+u);const mod=await import(/* @vite-ignore */ u);const api=mod?.pipeline?mod:(mod?.default?.pipeline?mod.default:null);if(api){window.transformers=api;log('ESM成功: '+u);return u;}log('ESM成功だがpipeline不在: '+u);}catch(e){log('ESM失敗: '+(e.message||e));}}
+  throw new Error('Transformers をロードできませんでした（CDN到達不可の可能性）');
+}
+
+/* ===== ASR/翻訳 初期化 ===== */
+let transcriber=null, translator=null;
+async function ensurePipelines(){
+  if(!window.transformers?.pipeline) await ensureTransformers();
+  const {pipeline,env}=window.transformers;
+  env.backends=env.backends||{}; env.backends.onnx=env.backends.onnx||{}; env.backends.onnx.wasm=env.backends.onnx.wasm||{};
+  env.backends.onnx.wasm.numThreads=1; env.backends.onnx.wasm.simd=false; env.backends.onnx.wasm.proxy=true;
+  const device=(navigator.gpu?'webgpu':'wasm');
+  const asrId=asrModelSel.value;
+  log(`ASRモデル: ${asrId} / device=${device}`);
+  transcriber=await pipeline('automatic-speech-recognition', asrId, { device });
+  transcriber.model_id=asrId;
+  const mtId='Helsinki-NLP/opus-mt-en-ja';
+  log(`翻訳モデル: ${mtId} / device=${device}`);
+  translator=await pipeline('translation', mtId, { device });
+}
+
+/* ===== ASRオプション（.enモデルなので language/task を明示しない＝衝突回避） ===== */
+function asrOpts(){
+  return {
+    return_timestamps: false,
+    // language/task は .en モデルの既定に任せる（forced_decoder_ids との衝突回避）
+    num_beams: 1,
+    condition_on_previous_text: false,
+    temperature: 0.1,
+    compression_ratio_threshold: 3.0,
+    logprob_threshold: -2.0,
+    no_speech_threshold: 0.2,
+    callback_function: (p)=>{ if(typeof p?.progress==='number'){ const v=Math.min(95,Math.max(5,Math.round(p.progress*100))); if(v-prog.value>=5) prog.value=v; } }
+  };
+}
+
+/* ===== VAD（簡易：RMS+ZCR） ===== */
+function isSilence(pcm){
+  const mode=vadSel.value; if(mode==='off') return false;
+  const n=pcm.length; if(!n) return true;
+  let s=0; for(let i=0;i<n;i++){ const x=pcm[i]; s+=x*x; }
+  const rms=Math.sqrt(s/n);
+  let z=0; for(let i=1;i<n;i++){ if((pcm[i-1]>=0)!==(pcm[i]>=0)) z++; }
+  const zcr=z/n;
+  const strong=(mode==='strong');
+  const rmsTh= strong?0.0045:0.0032;
+  const zcrTh= strong?0.016:0.013;
+  return (rms<rmsTh) || (zcr<zcrTh);
+}
+
+/* ===== AudioWorklet（16kHz/mono で0.25sごとに送出） ===== */
+const workletCode=`
+class PCMWorklet extends AudioWorkletProcessor{
+  constructor(){ super(); this.buf=[]; this.targetSR=16000; this.ratio=sampleRate/this.targetSR; }
+  process(inputs){ const ch=inputs[0]; if(!ch||!ch[0]) return true;
+    const L=ch[0]; const out=[]; const ratio=this.ratio; let pos=0;
+    while(pos<L.length){ out.push(L[Math.floor(pos)]); pos+=ratio; }
+    this.buf.push(...out);
+    if(this.buf.length>=this.targetSR*0.25){ const chunk=this.buf.splice(0,this.targetSR*0.25); this.port.postMessage(new Float32Array(chunk)); }
+    return true;
+  }
+}
+registerProcessor('pcm-worklet',PCMWorklet);`;
+
+/* ===== 録音〜推論 ===== */
+let mediaStream=null, audioCtx=null, workletNode=null, running=false, lastEndSec=0, overlapBuf=null;
+function appendLine(pane, startSec, text){
+  const div=document.createElement('div'); div.className='line';
+  const ts=document.createElement('span'); ts.className='ts'; ts.textContent='['+tfmt(Math.max(0,startSec))+'] ';
+  const sp=document.createElement('span'); sp.textContent=text;
+  div.appendChild(ts); div.appendChild(sp); pane.appendChild(div); pane.scrollTop=pane.scrollHeight;
+}
+async function runOnce(pcm, bufSec, overlapSec){
+  const startSec=lastEndSec - overlapSec; lastEndSec += bufSec;
+  if(isSilence(pcm)) return;
+  const r=await transcriber(pcm, asrOpts()); const text=(r?.text??'').trim(); if(!text) return;
+  appendLine(paneEn, startSec, text);
+  try{
+    const out=await translator(text);
+    const ja=(Array.isArray(out)? out[0]?.translation_text : out?.translation_text) || '';
+    if(ja) appendLine(paneJa, startSec, ja);
+  }catch(e){ log('翻訳失敗: '+(e.message||e)); }
+}
+
+/* ===== 開始/停止 ===== */
+async function start(){
+  startBtn.disabled=true; stopBtn.disabled=false; prog.value=0;
+  try{
+    stat.textContent='モデル読み込み中…';
+    await ensurePipelines();
+
+    stat.textContent='マイク許可を要求中…';
+    mediaStream=await navigator.mediaDevices.getUserMedia({
+      audio:{channelCount:1, noiseSuppression:true, echoCancellation:true, autoGainControl:true}
+    });
+
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
+    await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([workletCode],{type:'application/javascript'})));
+    const src=audioCtx.createMediaStreamSource(mediaStream);
+    workletNode=new AudioWorkletNode(audioCtx,'pcm-worklet'); src.connect(workletNode);
+
+    const bufSec=parseFloat(bufSel.value), overlapSec=parseFloat(ovSel.value);
+    const frameTarget=Math.floor(16000*bufSec), overlapCount=Math.floor(16000*overlapSec);
+    let acc=new Float32Array(0); overlapBuf=null; lastEndSec=0; running=true;
+
+    workletNode.port.onmessage=ev=>{
+      if(!running) return;
+      const chunk=ev.data;
+      const merged=new Float32Array(acc.length+chunk.length); merged.set(acc,0); merged.set(chunk,acc.length); acc=merged;
+      while(acc.length>=frameTarget){
+        let block=acc.subarray(0,frameTarget); acc=acc.subarray(frameTarget);
+        if(overlapBuf && overlapBuf.length && overlapSec>0){
+          const withOv=new Float32Array(overlapBuf.length+block.length);
+          withOv.set(overlapBuf,0); withOv.set(block,overlapBuf.length); block=withOv;
+        }
+        overlapBuf=(overlapSec>0)? block.subarray(block.length-overlapCount) : null;
+        runOnce(block, bufSec, overlapSec).catch(e=>log('runOnce error: '+(e.message||e)));
+      }
+    };
+    stat.textContent='録音中…推論中';
+  }catch(e){
+    startBtn.disabled=false; stopBtn.disabled=true;
+    stat.textContent='エラー: '+((e&&e.message)||e);
+    log('start() 失敗: '+(e.stack||e));
+  }
+}
+async function stop(){
+  running=false;
+  try{ workletNode?.disconnect(); }catch{}
+  try{ mediaStream?.getTracks().forEach(t=>t.stop()); }catch{}
+  try{ await audioCtx?.close(); }catch{}
+  startBtn.disabled=false; stopBtn.disabled=true;
+  stat.textContent='停止しました';
+}
+startBtn.addEventListener('click',start);
+stopBtn.addEventListener('click',stop);
+</script>
+</body>
+</html>
