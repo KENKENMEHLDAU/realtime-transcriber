@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>リアルタイム字幕 Lite（英→日）— ダウンロード不要</title>
+<style>
+  :root{--bg:#0b1220;--panel:#0f172a;--text:#e5e7eb;--muted:#9fb3c8;--border:#243041;--accent:#22c55e;--danger:#ef4444}
+  *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#0b1220,#0f172a);color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:16px 12px;text-align:center} h1{margin:0;font-size:clamp(18px,3vw,24px)}
+  .app{max-width:1100px;margin:0 auto;padding:0 12px 22px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .card{background:rgba(17,24,39,.7);border:1px solid var(--border);border-radius:12px;padding:12px}
+  button,select{padding:9px 12px;border-radius:10px;border:1px solid var(--border);background:#0d1424;color:#fff}
+  button.primary{background:var(--accent);border-color:transparent;color:#06250f;font-weight:700}
+  button.danger{background:var(--danger);border-color:transparent}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .pane{background:#0b1220;border:1px solid var(--border);border-radius:12px;min-height:320px;padding:10px;overflow:auto;line-height:1.6}
+  .pane h3{margin:6px 0 8px 0;font-size:14px;color:#b7c6dc}
+  .line{margin:6px 0}
+  .ts{color:#8ea6c8;font-family:ui-monospace,Consolas,Menlo,monospace;margin-right:6px}
+  .tools{display:inline-flex;gap:6px;margin-left:6px}
+  .status{font-size:12px;color:#9fb3c8}
+  .warn{background:#3b2f00;border:1px solid #7c5c00;color:#ffe08a;padding:8px;border-radius:8px;margin-top:8px}
+  .mono{font-family:ui-monospace,Consolas,Menlo,monospace}
+</style>
+</head>
+<body>
+<header>
+  <h1>リアルタイム録音 → 文字起こし（左：英語 / 右：日本語は DeepLで表示）— Lite</h1>
+  <div class="status">※ この版は <b>ブラウザ内蔵の音声認識のみ</b> を使用（モデルDL不要・即起動）。右枠は DeepL で開きます。</div>
+</header>
+
+<div class="app">
+  <div class="card">
+    <div class="row">
+      <label>認識言語
+        <select id="langSel">
+          <option value="en-US" selected>English (US)</option>
+          <option value="en-GB">English (UK)</option>
+        </select>
+      </label>
+      <button id="startBtn" class="primary">🎙️ 開始</button>
+      <button id="stopBtn" class="danger" disabled>⏹ 停止</button>
+      <span id="stat" class="status">準備OK：開始を押してください（Chrome 推奨）。</span>
+    </div>
+    <div class="warn" id="compat" style="display:none">
+      このブラウザは <b>Web Speech API（音声認識）</b> 非対応です。Chrome 最新版をお使いください。<br>
+      もしくは Whisper 版/Electron 版をご利用ください。
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:12px">
+    <div class="card"><div class="pane" id="paneEn"><h3>English (ASR)</h3></div></div>
+    <div class="card"><div class="pane" id="paneJa"><h3>日本語訳 (DeepLで開きます)</h3><div class="status">各行の 🔗 を押すと DeepL のタブが開き、日本語訳が表示されます。</div></div></div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <div class="status mono" id="log"></div>
+  </div>
+</div>
+
+<script>
+const logEl=document.getElementById('log'), stat=document.getElementById('stat');
+const paneEn=document.getElementById('paneEn'), paneJa=document.getElementById('paneJa');
+const startBtn=document.getElementById('startBtn'), stopBtn=document.getElementById('stopBtn');
+const langSel=document.getElementById('langSel');
+const log=(m)=>{logEl.textContent+=(logEl.textContent?'\n':'')+m;logEl.scrollTop=logEl.scrollHeight;};
+const tfmt=(s)=>{const mm=String(Math.floor(s/60)).padStart(2,'0'); const ss=String(Math.floor(s%60)).padStart(2,'0'); return mm+':'+ss;};
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if(!SR){ document.getElementById('compat').style.display='block'; }
+
+let recog=null, running=false, t0=0;
+function addLine(timeSec, text){
+  const enLine=document.createElement('div'); enLine.className='line';
+  const ts=document.createElement('span'); ts.className='ts'; ts.textContent='['+tfmt(timeSec)+'] ';
+  const sp=document.createElement('span'); sp.textContent=text;
+  const tools=document.createElement('span'); tools.className='tools';
+  const btn=document.createElement('button'); btn.textContent='🔗 DeepL'; btn.title='翻訳をDeepLで開く';
+  btn.onclick=()=>{ const url='https://www.deepl.com/translator#en/ja/'+encodeURIComponent(text); window.open(url,'_blank'); };
+  tools.appendChild(btn);
+  enLine.appendChild(ts); enLine.appendChild(sp); enLine.appendChild(tools);
+  paneEn.appendChild(enLine); paneEn.scrollTop=paneEn.scrollHeight;
+
+  const jaLine=document.createElement('div'); jaLine.className='line';
+  const ts2=document.createElement('span'); ts2.className='ts'; ts2.textContent='['+tfmt(timeSec)+'] ';
+  const hint=document.createElement('span'); hint.textContent='（この行を DeepL で開くには左の 🔗 をクリック）';
+  jaLine.appendChild(ts2); jaLine.appendChild(hint);
+  paneJa.appendChild(jaLine); paneJa.scrollTop=paneJa.scrollHeight;
+}
+
+function start(){
+  if(!SR){ stat.textContent='非対応ブラウザです。'; return; }
+  recog=new SR(); recog.lang=langSel.value; recog.continuous=true; recog.interimResults=true;
+  recog.onstart=()=>{ running=true; t0=performance.now(); stat.textContent='聴取中… 話しかけてください'; };
+  recog.onresult=(ev)=>{
+    for(let i=ev.resultIndex;i<ev.results.length;i++){
+      const res=ev.results[i], txt=res[0].transcript.trim();
+      if(!txt) continue;
+      if(res.isFinal){ const t=((performance.now()-t0)/1000); addLine(t, txt); }
+    }
+  };
+  recog.onerror=(e)=>{ log('SpeechRecognition error: '+(e.error||e.message||e)); stat.textContent='エラー: '+(e.error||e.message||e); };
+  recog.onend=()=>{ running=false; if(stopBtn.disabled===false){ try{ recog.start(); }catch{} } };
+  try{ recog.start(); startBtn.disabled=true; stopBtn.disabled=false; }catch(e){ stat.textContent='開始失敗: '+(e.message||e); }
+}
+function stop(){ try{ recog&&recog.stop(); }catch{} running=false; startBtn.disabled=false; stopBtn.disabled=true; stat.textContent='停止しました'; }
+
+startBtn.addEventListener('click', start);
+stopBtn.addEventListener('click', stop);
+</script>
+</body>
+</html>
