@@ -1,116 +1,293 @@
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>リアルタイム字幕 Lite（英→日）— ダウンロード不要</title>
-<style>
-  :root{--bg:#0b1220;--panel:#0f172a;--text:#e5e7eb;--muted:#9fb3c8;--border:#243041;--accent:#22c55e;--danger:#ef4444}
-  *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#0b1220,#0f172a);color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-  header{padding:16px 12px;text-align:center} h1{margin:0;font-size:clamp(18px,3vw,24px)}
-  .app{max-width:1100px;margin:0 auto;padding:0 12px 22px}
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-  .card{background:rgba(17,24,39,.7);border:1px solid var(--border);border-radius:12px;padding:12px}
-  button,select{padding:9px 12px;border-radius:10px;border:1px solid var(--border);background:#0d1424;color:#fff}
-  button.primary{background:var(--accent);border-color:transparent;color:#06250f;font-weight:700}
-  button.danger{background:var(--danger);border-color:transparent}
-  button:disabled{opacity:.6;cursor:not-allowed}
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .pane{background:#0b1220;border:1px solid var(--border);border-radius:12px;min-height:320px;padding:10px;overflow:auto;line-height:1.6}
-  .pane h3{margin:6px 0 8px 0;font-size:14px;color:#b7c6dc}
-  .line{margin:6px 0}
-  .ts{color:#8ea6c8;font-family:ui-monospace,Consolas,Menlo,monospace;margin-right:6px}
-  .tools{display:inline-flex;gap:6px;margin-left:6px}
-  .status{font-size:12px;color:#9fb3c8}
-  .warn{background:#3b2f00;border:1px solid #7c5c00;color:#ffe08a;padding:8px;border-radius:8px;margin-top:8px}
-  .mono{font-family:ui-monospace,Consolas,Menlo,monospace}
-</style>
-</head>
-<body>
-<header>
-  <h1>リアルタイム録音 → 文字起こし（左：英語 / 右：日本語）— Lite</h1>
-  <div class="status">※ ブラウザ内蔵の音声認識のみを使用。外部モデルDL不要。翻訳は DeepL をワンクリックで開きます。</div>
-</header>
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-<div class="app">
-  <div class="card">
-    <div class="row">
-      <label>認識言語
-        <select id="langSel">
-          <option value="en-US" selected>English (US)</option>
-          <option value="en-GB">English (UK)</option>
-        </select>
-      </label>
-      <button id="startBtn" class="primary">🎙️ 開始</button>
-      <button id="stopBtn" class="danger" disabled>⏹ 停止</button>
-      <span id="stat" class="status">準備OK：開始を押してください（Chrome 推奨）</span>
-    </div>
-    <div class="warn" id="compat" style="display:none">
-      このブラウザは <b>Web Speech API（音声認識）</b> 非対応です。Chrome/Edge をお使いください。
-    </div>
-  </div>
+// ✅ Recommended, production-friendly debugging build
+// - Hardened error handling for SpeechRecognition events (never throws from callbacks)
+// - HTTPS / localhost requirement check
+// - Optional preflight mic permission via getUserMedia() with immediate release to avoid capture conflicts
+// - Auto-restart with exponential backoff for recoverable errors/onend
+// - Clear status/error banners + metrics
+// - Built-in self-tests for the error formatter (kept + expanded)
 
-  <div class="grid" style="margin-top:12px">
-    <div class="card"><div class="pane" id="paneEn"><h3>English (ASR)</h3></div></div>
-    <div class="card"><div class="pane" id="paneJa"><h3>日本語訳</h3><div class="status">各行の 🔗 を押すと DeepL で翻訳を表示します。</div></div></div>
-  </div>
-
-  <div class="card" style="margin-top:12px">
-    <div class="status mono" id="log"></div>
-  </div>
-</div>
-
-<script>
-const logEl=document.getElementById('log'), stat=document.getElementById('stat');
-const paneEn=document.getElementById('paneEn'), paneJa=document.getElementById('paneJa');
-const startBtn=document.getElementById('startBtn'), stopBtn=document.getElementById('stopBtn');
-const langSel=document.getElementById('langSel');
-const log=(m)=>{logEl.textContent+=(logEl.textContent?'\n':'')+m;logEl.scrollTop=logEl.scrollHeight;};
-const tfmt=(s)=>{const mm=String(Math.floor(s/60)).padStart(2,'0'); const ss=String(Math.floor(s%60)).padStart(2,'0'); return mm+':'+ss;};
-
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-if(!SR){ document.getElementById('compat').style.display='block'; }
-
-let recog=null, running=false, t0=0;
-function addLine(timeSec, text){
-  // 左（英語）
-  const enLine=document.createElement('div'); enLine.className='line';
-  const ts=document.createElement('span'); ts.className='ts'; ts.textContent='['+tfmt(timeSec)+'] ';
-  const sp=document.createElement('span'); sp.textContent=text;
-  const tools=document.createElement('span'); tools.className='tools';
-  const btn=document.createElement('button'); btn.textContent='🔗 DeepL'; btn.title='翻訳をDeepLで開く';
-  btn.onclick=()=>{ const url='https://www.deepl.com/translator#en/ja/'+encodeURIComponent(text); window.open(url,'_blank'); };
-  tools.appendChild(btn);
-  enLine.appendChild(ts); enLine.appendChild(sp); enLine.appendChild(tools);
-  paneEn.appendChild(enLine); paneEn.scrollTop=paneEn.scrollHeight;
-
-  // 右（日本語欄にはヒントを表示）
-  const jaLine=document.createElement('div'); jaLine.className='line';
-  const ts2=document.createElement('span'); ts2.className='ts'; ts2.textContent='['+tfmt(timeSec)+'] ';
-  const hint=document.createElement('span'); hint.textContent='（この行を DeepL で開くには左の 🔗 をクリック）';
-  jaLine.appendChild(ts2); jaLine.appendChild(hint);
-  paneJa.appendChild(jaLine); paneJa.scrollTop=paneJa.scrollHeight;
+function getSpeechRecognition() {
+  if (typeof window === "undefined") return null;
+  const w = window; // any
+  return w.SpeechRecognition || w.webkitSpeechRecognition || null;
 }
 
-function start(){
-  if(!SR){ stat.textContent='非対応ブラウザです。'; return; }
-  recog=new SR(); recog.lang=langSel.value; recog.continuous=true; recog.interimResults=true;
-  recog.onstart=()=>{ running=true; t0=performance.now(); stat.textContent='聴取中… 話しかけてください'; };
-  recog.onresult=(ev)=>{
-    for(let i=ev.resultIndex;i<ev.results.length;i++){
-      const res=ev.results[i], txt=res[0].transcript.trim();
-      if(!txt) continue;
-      if(res.isFinal){ const t=((performance.now()-t0)/1000); addLine(t, txt); }
+function hhmmss(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function safeStringify(obj) {
+  const seen = new WeakSet();
+  try {
+    return JSON.stringify(
+      obj,
+      (k, v) => {
+        if (typeof v === "object" && v !== null) {
+          if (seen.has(v)) return "[Circular]";
+          seen.add(v);
+        }
+        if (typeof v === "function") return `[Function ${v.name || "anonymous"}]`;
+        return v;
+      },
+      2
+    );
+  } catch {
+    try { return String(obj); } catch { return "[Unstringifiable]"; }
+  }
+}
+
+function describeSRError(e) {
+  if (!e) return "Unknown error (no event)";
+  const parts = [];
+  if (e.type) parts.push(`type=${e.type}`);
+  if (e.name) parts.push(`name=${e.name}`);
+  if (e.error) parts.push(`error=${e.error}`);
+  if (e.message) parts.push(`message=${e.message}`);
+  const tgt = e.target || e.currentTarget;
+  try {
+    if (tgt) {
+      if (typeof tgt.error === "string") parts.push(`target.error=${tgt.error}`);
+      if (typeof tgt.message === "string") parts.push(`target.message=${tgt.message}`);
+      if (typeof tgt.name === "string") parts.push(`target.name=${tgt.name}`);
     }
-  };
-  recog.onerror=(e)=>{ log('SpeechRecognition error: '+(e.error||e.message||e)); stat.textContent='エラー: '+(e.error||e.message||e); };
-  recog.onend=()=>{ running=false; if(stopBtn.disabled===false){ try{ recog.start(); }catch{} } };
-  try{ recog.start(); startBtn.disabled=true; stopBtn.disabled=false; }catch(e){ stat.textContent='開始失敗: '+(e.message||e); }
+  } catch {}
+  return parts.length ? parts.join(" | ") : `raw=${safeStringify(e)}`;
 }
-function stop(){ try{ recog&&recog.stop(); }catch{} running=false; startBtn.disabled=false; stopBtn.disabled=true; stat.textContent='停止しました'; }
 
-startBtn.addEventListener('click', start);
-stopBtn.addEventListener('click', stop);
-</script>
-</body>
-</html>
+// Classify whether the error is recoverable (should auto-restart)
+function isRecoverableSRError(errSummary) {
+  // Conservative: restart on transient/no-speech/network/audio-capture/aborted
+  const s = (errSummary || "").toLowerCase();
+  return [
+    "no-speech",
+    "network",
+    "audio-capture",
+    "aborted",
+    "service-not-available",
+    "not-allowed-temporary",
+  ].some((kw) => s.includes(kw));
+}
+
+export default function LiveTranscribeAndTranslate() {
+  const SpeechRecognition = useMemo(() => getSpeechRecognition(), []);
+  const [secure] = useState(typeof window !== "undefined" ? window.isSecureContext : true);
+  const [supported, setSupported] = useState(false);
+  const [recognizing, setRecognizing] = useState(false);
+  const [sourceLang, setSourceLang] = useState("en-US");
+  const [rows, setRows] = useState([]); // {time, en, interim?}
+  const [statusMsg, setStatusMsg] = useState("");
+  const [errorMsg, setErrorMsg] = useState("");
+  const [testResults, setTestResults] = useState([]);
+
+  // Auto-restart policy
+  const [autoRestart, setAutoRestart] = useState(true);
+  const [backoffMs, setBackoffMs] = useState(500);
+  const backoffTimer = useRef(null);
+
+  const recogRef = useRef(null);
+
+  useEffect(() => setSupported(!!SpeechRecognition), [SpeechRecognition]);
+
+  useEffect(() => {
+    const handler = (ev) => {
+      setErrorMsg((prev) => `${prev ? prev + "\n" : ""}Window error: ${ev?.message || safeStringify(ev)}`);
+    };
+    window.addEventListener("error", handler);
+    return () => window.removeEventListener("error", handler);
+  }, []);
+
+  const ensureMicPermission = async () => {
+    // Ask once and immediately release to avoid capture conflict with SR
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    try { s.getTracks().forEach((t) => t.stop()); } catch {}
+  };
+
+  const scheduleRestart = useCallback(() => {
+    if (!autoRestart) return;
+    const next = Math.min(backoffMs * 2, 8000);
+    const wait = backoffMs;
+    setStatusMsg(`再開待機中… ${Math.round(wait/1000)}s`);
+    if (backoffTimer.current) clearTimeout(backoffTimer.current);
+    backoffTimer.current = setTimeout(() => {
+      setBackoffMs(next);
+      start();
+    }, wait);
+  }, [autoRestart, backoffMs]);
+
+  const start = useCallback(async () => {
+    setErrorMsg("");
+    setStatusMsg("");
+
+    if (!secure) {
+      setErrorMsg("このページは非HTTPSです。https:// または http://localhost で開いてください。");
+      return;
+    }
+    if (!SpeechRecognition) {
+      setSupported(false);
+      setErrorMsg("このブラウザは Web Speech API に未対応です（Chrome/Edge 推奨）。");
+      return;
+    }
+
+    try {
+      await ensureMicPermission();
+    } catch (e) {
+      setErrorMsg("マイク権限が得られませんでした。アドレスバーの鍵アイコンから『マイク→許可』にしてください。");
+      return;
+    }
+
+    try {
+      const recog = new SpeechRecognition();
+      recog.lang = sourceLang;
+      recog.continuous = true;
+      recog.interimResults = true;
+
+      recog.onstart = () => {
+        setRecognizing(true);
+        setStatusMsg("認識を開始しました。");
+        setBackoffMs(500); // reset backoff on successful start
+      };
+
+      recog.onresult = (event) => {
+        try {
+          let interimText = "";
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const res = event.results[i];
+            const txt = res?.[0]?.transcript ?? "";
+            if (!txt) continue;
+            if (res.isFinal) {
+              const time = hhmmss();
+              setRows((prev) => [...prev.filter((r) => !r.interim), { time, en: txt }]);
+            } else {
+              interimText += txt;
+            }
+          }
+          if (interimText) {
+            setRows((prev) => [...prev.filter((r) => !r.interim), { time: "interim", en: interimText, interim: true }]);
+          } else {
+            setRows((prev) => prev.filter((r) => !r.interim));
+          }
+        } catch (err) {
+          setErrorMsg(`結果処理エラー: ${err?.message || safeStringify(err)}`);
+        }
+      };
+
+      recog.onerror = (e) => {
+        const summary = describeSRError(e);
+        setErrorMsg(`音声認識エラー: ${summary}`);
+        // auto-restart for recoverable errors
+        if (isRecoverableSRError(summary)) scheduleRestart();
+      };
+
+      recog.onnomatch = () => {
+        setStatusMsg("音声は検出しましたが文字起こしできませんでした（無音/雑音の可能性）。");
+      };
+
+      recog.onend = () => {
+        setRecognizing(false);
+        setStatusMsg((s) => s || "認識が終了しました。");
+        // Some engines call onend without error; allow auto restart to keep session alive
+        if (autoRestart) scheduleRestart();
+      };
+
+      recogRef.current = recog;
+      recog.start();
+    } catch (e) {
+      setErrorMsg(`開始に失敗: ${e?.message || safeStringify(e)}`);
+    }
+  }, [SpeechRecognition, sourceLang, secure, autoRestart, backoffMs, scheduleRestart]);
+
+  const stop = useCallback(() => {
+    if (backoffTimer.current) {
+      clearTimeout(backoffTimer.current);
+      backoffTimer.current = null;
+    }
+    try { recogRef.current?.stop(); } catch {}
+    setRecognizing(false);
+    setStatusMsg("停止しました。");
+  }, []);
+
+  // --- Self tests (expanded) ---
+  const runErrorTests = () => {
+    const samples = [
+      { label: "undefined", e: undefined },
+      { label: "empty object", e: {} },
+      { label: "plain Error", e: new Error("boom") },
+      { label: "legacy SR error field", e: { error: "no-speech" } },
+      { label: "name+message", e: { name: "NotAllowedError", message: "Permission denied" } },
+      { label: "target.error", e: { type: "error", target: { error: "audio-capture" } } },
+      { label: "DOM Event", e: new Event("error") },
+      { label: "with currentTarget", e: { type: "error", currentTarget: { error: "network" } } },
+    ];
+    const results = samples.map(({ label, e }) => ({
+      label,
+      output: describeSRError(e),
+      note: "should produce a readable string without throwing",
+    }));
+    setTestResults(results);
+  };
+
+  const clearTests = () => setTestResults([]);
+
+  return (
+    <div className="p-4">
+      <h1 className="text-xl font-bold mb-2">推奨版: リアルタイム文字起こし（堅牢＆自動再開）</h1>
+
+      {!supported && <div className="text-red-600 mb-2">このブラウザは Web Speech API に未対応です（Chrome/Edge 推奨）</div>}
+      {!secure && <div className="text-red-600 mb-2">このページは非HTTPSです。https:// か http://localhost で開いてください。</div>}
+      {statusMsg && <div className="text-green-700 mb-2">{statusMsg}</div>}
+      {errorMsg && <div className="text-red-700 whitespace-pre-wrap mb-2">{errorMsg}</div>}
+
+      <div className="flex flex-wrap gap-2 mb-3 items-center">
+        <button onClick={start} disabled={!supported || recognizing} className="px-3 py-1 bg-emerald-600 text-white rounded disabled:opacity-50">開始</button>
+        <button onClick={stop} disabled={!recognizing && !backoffTimer.current} className="px-3 py-1 bg-gray-300 rounded">停止</button>
+        <select value={sourceLang} onChange={(e)=>setSourceLang(e.target.value)} className="px-2 py-1 border rounded">
+          <option value="en-US">English (US)</option>
+          <option value="en-GB">English (UK)</option>
+          <option value="en-AU">English (AU)</option>
+          <option value="en-CA">English (CA)</option>
+          <option value="en-IN">English (IN)</option>
+        </select>
+        <label className="flex items-center gap-2 text-sm ml-2">
+          <input type="checkbox" className="h-4 w-4" checked={autoRestart} onChange={(e)=>setAutoRestart(e.target.checked)} />
+          自動再開（リカバリー）
+        </label>
+        <button onClick={()=>setBackoffMs(500)} className="px-2 py-1 text-sm bg-neutral-200 rounded">バックオフをリセット</button>
+        <span className="text-xs opacity-70">backoff: {Math.round(backoffMs/1000)}s</span>
+      </div>
+
+      <div className="border p-2 h-64 overflow-auto bg-white mb-4">
+        {rows.length === 0 ? (
+          <div className="opacity-70">ここに結果が表示されます… 「開始」を押して話し始めてください。</div>
+        ) : rows.map((r, idx) => (
+          <div key={idx} className={r.interim ? "italic opacity-70" : ""}>
+            [{r.time}] {r.en}
+          </div>
+        ))}
+      </div>
+
+      {/* --- Error handler self-tests --- */}
+      <div className="border rounded p-3 bg-neutral-50">
+        <div className="font-semibold mb-2">エラーハンドラ自己テスト</div>
+        <div className="text-sm mb-2">期待動作: <span className="underline">どのケースでもクラッシュせず、説明テキストを表示</span></div>
+        <div className="flex gap-2 mb-3">
+          <button onClick={runErrorTests} className="px-3 py-1 bg-blue-600 text-white rounded">テスト実行</button>
+          <button onClick={clearTests} className="px-3 py-1 bg-gray-300 rounded">クリア</button>
+        </div>
+        {testResults.length > 0 && (
+          <div className="max-h-64 overflow-auto bg-white border p-2">
+            {testResults.map((t, i) => (
+              <div key={i} className="mb-2">
+                <div className="text-xs text-gray-700">case: {t.label}</div>
+                <div className="text-sm">→ {t.output}</div>
+                <div className="text-[11px] text-gray-500">({t.note})</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
